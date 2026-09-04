@@ -2,6 +2,8 @@
 
 ![CI](https://github.com/AlanGarci4/cicd-grupo-6/actions/workflows/ci.yml/badge.svg)
 
+_Nota: commit de validação para gerar required checks do CI no PR de teste._
+
 ## Membros
 - @AlanGarci4 (Owner) · @tuliocoimbra · @danielarrais · José · Tiago
 
