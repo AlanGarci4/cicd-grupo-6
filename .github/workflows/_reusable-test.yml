@@ -31,15 +31,17 @@ jobs:
           python -m pip install -r requirements.txt -r requirements-dev.txt
 
       - name: Run Trivy filesystem scan
-        uses: aquasecurity/trivy-action@76071ef0d7ec797419534a183b498b4d6366cf37
-        with:
-          scan-type: fs
-          scan-ref: .
-          format: sarif
-          output: trivy-results.sarif
-          severity: HIGH,CRITICAL
-          ignore-unfixed: true
-          exit-code: '1'
+        run: |
+          docker run --rm \
+            -v "${PWD}:/src" \
+            aquasec/trivy:0.63.0 \
+            fs /src \
+            --scanners vuln \
+            --severity HIGH,CRITICAL \
+            --ignore-unfixed \
+            --format sarif \
+            --output /src/trivy-results.sarif \
+            --exit-code 1
 
       - name: Upload Trivy scan results
         uses: github/codeql-action/upload-sarif@b1722c1245f90604c2c348f9d1624af97ea8fc6e
