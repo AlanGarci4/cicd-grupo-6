@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  test:
+    name: Test (Python ${{ matrix.python-version }})
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.10', '3.11', '3.12']
+    uses: ./.github/workflows/_reusable-test.yml
+    with:
+      python-version: ${{ matrix.python-version }}
+
+  deploy-staging:
+    name: Deploy to staging (dummy)
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+    steps:
+      - name: Placeholder deployment gate
+        run: |
+          echo "This deployment is protected by the staging environment approval gate."
+          echo "A required reviewer must approve before the job proceeds."
+
+  push:
+    name: Publish Docker image
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Log in to Docker Hub
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          echo "${DOCKERHUB_TOKEN}" | docker login --username "${DOCKERHUB_USERNAME}" --password-stdin
+
+      - name: Build and push image
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          SHA_TAG: ${{ github.sha }}
+        run: |
+          SHORT_SHA="${SHA_TAG::7}"
+          IMAGE_NAME="${DOCKERHUB_USERNAME}/todolist"
+          docker build -t "${IMAGE_NAME}:${SHORT_SHA}" -t "${IMAGE_NAME}:latest" .
+          docker push "${IMAGE_NAME}:${SHORT_SHA}"
+          docker push "${IMAGE_NAME}:latest"
+
+  notify:
+    name: Notify status
+    needs: [test, deploy-staging, push]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send run result to webhook
+        env:
+          WEBHOOK_URL: ${{ secrets.NOTIFY_WEBHOOK_URL }}
+          TEST_RESULT: ${{ needs.test.result }}
+          DEPLOY_RESULT: ${{ needs.deploy-staging.result || 'skipped' }}
+          PUSH_RESULT: ${{ needs.push.result || 'skipped' }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "${WEBHOOK_URL}" ]; then
+            echo "No notification webhook configured; skipping alert."
+            exit 0
+          fi
+
+          if [ "${TEST_RESULT}" = "success" ] && [ "${DEPLOY_RESULT}" != "failure" ] && [ "${PUSH_RESULT}" != "failure" ]; then
+            STATUS="CI passou"
+          else
+            STATUS="CI falhou"
+          fi
+
+          curl -fsSL -X POST \
+            -H "Content-Type: application/json" \
+            --data "{\"text\":\"${STATUS} • ${RUN_URL} • test=${TEST_RESULT} • deploy=${DEPLOY_RESULT} • push=${PUSH_RESULT}\"}" \
+            "${WEBHOOK_URL}"
