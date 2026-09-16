@@ -283,7 +283,7 @@ Cadastrados em **Settings → Secrets and variables → Actions**.
 
 | Nome | Tipo | Para quê |
 |---|---|---|
-| `DOCKERHUB_USERNAME` | secret | Usuário/organização no Docker Hub. Compõe o nome da imagem: `<usuário>/todolist` |
+| `DOCKERHUB_USERNAME` | secret | Usuário/organização no Docker Hub. Compõe o nome da imagem: `<usuário>/app-k8s-todolist` |
 | `DOCKERHUB_TOKEN` | secret | Access token do Docker Hub (**nunca** a senha da conta) |
 | `NOTIFY_WEBHOOK_URL` | secret | Webhook do canal Slack/Discord do time |
 | `STAGING_URL` | secret | Valor dummy, cadastrado **dentro** do environment `staging` |
