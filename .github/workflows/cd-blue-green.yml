@@ -1,0 +1,211 @@
+name: CD Blue/Green deploy
+
+run-name: Blue/Green deploy to ${{ inputs.color }} (${{ inputs.image_tag }})
+
+on:
+  workflow_dispatch:
+    inputs:
+      color:
+        description: Inactive slot that will receive the candidate image
+        required: true
+        type: choice
+        options:
+          - green
+          - blue
+        default: green
+      image_tag:
+        description: Short commit SHA published by CI
+        required: true
+        type: string
+      baseline_tag:
+        description: Baseline SHA; required only when bootstrapping the namespace
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cd-blue-green
+  cancel-in-progress: false
+
+env:
+  IMAGE_NAME: todolist
+  NAMESPACE: todolist-bg
+  REMOTE_MANIFEST: blue-green-${{ github.run_id }}-${{ github.run_attempt }}.yaml
+
+jobs:
+  deploy:
+    name: Deploy candidate to inactive slot
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Validate deployment inputs
+        env:
+          BASELINE_TAG: ${{ inputs.baseline_tag }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          KIND_CLUSTER: ${{ vars.KIND_CLUSTER || 'devops-labs' }}
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF}" != "refs/heads/main" ]; then
+            echo "CD workflows must be run from the main branch." >&2
+            exit 1
+          fi
+          if [[ ! "${IMAGE_TAG}" =~ ^[0-9a-f]{7}$ ]]; then
+            echo "image_tag must be a seven-character lowercase commit SHA." >&2
+            exit 1
+          fi
+          if [ -n "${BASELINE_TAG}" ] && [[ ! "${BASELINE_TAG}" =~ ^[0-9a-f]{7}$ ]]; then
+            echo "baseline_tag must be empty or a seven-character lowercase commit SHA." >&2
+            exit 1
+          fi
+          if [[ ! "${DOCKERHUB_USERNAME}" =~ ^[a-z0-9][a-z0-9._-]*$ ]]; then
+            echo "DOCKERHUB_USERNAME is missing or invalid." >&2
+            exit 1
+          fi
+          if [[ ! "${KIND_CLUSTER}" =~ ^[a-z0-9][a-z0-9-]*[a-z0-9]$ ]]; then
+            echo "KIND_CLUSTER is invalid." >&2
+            exit 1
+          fi
+
+      - name: Confirm images exist in Docker Hub
+        env:
+          BASELINE_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ inputs.baseline_tag }}
+          BASELINE_TAG: ${{ inputs.baseline_tag }}
+          IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ inputs.image_tag }}
+        run: |
+          set -euo pipefail
+          docker manifest inspect "${IMAGE}" >/dev/null
+          if [ -n "${BASELINE_TAG}" ]; then
+            docker manifest inspect "${BASELINE_IMAGE}" >/dev/null
+          fi
+
+      - name: Render bootstrap manifest
+        env:
+          BASELINE_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ inputs.baseline_tag }}
+          BASELINE_TAG: ${{ inputs.baseline_tag }}
+        run: |
+          set -euo pipefail
+          if [ -n "${BASELINE_TAG}" ]; then
+            sed -i -E "s#^([[:space:]]*)image:.*#\1image: ${BASELINE_IMAGE}#" k8s/blue-green/bootstrap.yaml
+            count="$(grep -Fc "image: ${BASELINE_IMAGE}" k8s/blue-green/bootstrap.yaml)"
+            if [ "${count}" -ne 2 ]; then
+              echo "Expected to render two baseline image references, found ${count}." >&2
+              exit 1
+            fi
+          fi
+
+      - name: Configure SSH
+        uses: ./.github/actions/configure-ssh
+        with:
+          ssh-key: ${{ secrets.EC2_SSH_KEY }}
+          host: ${{ secrets.EC2_HOST }}
+
+      - name: Copy bootstrap manifest to EC2
+        env:
+          SSH_HOST: ${{ secrets.EC2_HOST }}
+          SSH_USER: ${{ secrets.EC2_USER }}
+        run: |
+          scp -i ~/.ssh/id_ed25519 \
+            -o BatchMode=yes \
+            -o ConnectTimeout=15 \
+            -o StrictHostKeyChecking=yes \
+            k8s/blue-green/bootstrap.yaml \
+            "${SSH_USER}@${SSH_HOST}:${REMOTE_MANIFEST}"
+
+      - name: Bootstrap if needed and deploy candidate
+        env:
+          BASELINE_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ inputs.baseline_tag }}
+          BASELINE_TAG: ${{ inputs.baseline_tag }}
+          COLOR: ${{ inputs.color }}
+          IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ inputs.image_tag }}
+          KIND_CLUSTER: ${{ vars.KIND_CLUSTER || 'devops-labs' }}
+          SSH_HOST: ${{ secrets.EC2_HOST }}
+          SSH_USER: ${{ secrets.EC2_USER }}
+        run: |
+          ssh -i ~/.ssh/id_ed25519 \
+            -o BatchMode=yes \
+            -o ConnectTimeout=15 \
+            -o StrictHostKeyChecking=yes \
+            "${SSH_USER}@${SSH_HOST}" \
+            "BASELINE_IMAGE='${BASELINE_IMAGE}' BASELINE_TAG='${BASELINE_TAG}' COLOR='${COLOR}' EXPECTED_IMAGE='${IMAGE}' KIND_CLUSTER='${KIND_CLUSTER}' MANIFEST='${REMOTE_MANIFEST}' NAMESPACE='${NAMESPACE}' bash -s" <<'REMOTE'
+          set -euo pipefail
+          trap 'rm -f "${HOME}/${MANIFEST}"' EXIT
+
+          kubectl config use-context "kind-${KIND_CLUSTER}"
+
+          if ! kubectl get namespace "${NAMESPACE}" >/dev/null 2>&1; then
+            if [ "${COLOR}" != green ]; then
+              echo "The first candidate must be deployed to green because production starts on blue." >&2
+              exit 1
+            fi
+            if [ -z "${BASELINE_TAG}" ]; then
+              echo "baseline_tag is required to bootstrap the Blue/Green namespace." >&2
+              exit 1
+            fi
+
+            echo "Bootstrapping both slots with baseline ${BASELINE_IMAGE}."
+            kubectl apply -f "${HOME}/${MANIFEST}"
+            kubectl rollout status deployment/todolist-blue -n "${NAMESPACE}" --timeout=120s
+            kubectl rollout status deployment/todolist-green -n "${NAMESPACE}" --timeout=120s
+          else
+            for resource in \
+              deployment/todolist-blue \
+              deployment/todolist-green \
+              service/todolist-blue \
+              service/todolist-green \
+              service/todolist \
+              ingress/todolist-bg; do
+              if ! kubectl get "${resource}" -n "${NAMESPACE}" >/dev/null 2>&1; then
+                echo "Blue/Green namespace is incomplete: missing ${resource}." >&2
+                exit 1
+              fi
+            done
+          fi
+
+          active="$(kubectl get service/todolist -n "${NAMESPACE}" -o jsonpath='{.spec.selector.color}')"
+          if [ "${active}" != blue ] && [ "${active}" != green ]; then
+            echo "Production Service has an invalid active color: ${active}." >&2
+            exit 1
+          fi
+          if [ "${COLOR}" = "${active}" ]; then
+            echo "Refusing to deploy directly to the active ${active} slot." >&2
+            exit 1
+          fi
+
+          echo "Production remains on ${active}; deploying ${EXPECTED_IMAGE} to ${COLOR}."
+          kubectl set image "deployment/todolist-${COLOR}" todolist="${EXPECTED_IMAGE}" -n "${NAMESPACE}"
+          kubectl rollout status "deployment/todolist-${COLOR}" -n "${NAMESPACE}" --timeout=120s
+
+          actual_image="$(kubectl get "deployment/todolist-${COLOR}" -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.containers[?(@.name=="todolist")].image}')"
+          if [ "${actual_image}" != "${EXPECTED_IMAGE}" ]; then
+            echo "Expected ${EXPECTED_IMAGE}, but ${COLOR} uses ${actual_image}." >&2
+            exit 1
+          fi
+
+          for attempt in $(seq 1 20); do
+            if curl -fsS -H "Host: ${COLOR}.todolist-bg.local" http://localhost/healthz; then
+              echo
+              break
+            fi
+            if [ "${attempt}" -eq 20 ]; then
+              echo "Smoke test for the ${COLOR} slot failed." >&2
+              exit 1
+            fi
+            echo "Slot smoke test attempt ${attempt}/20 failed; retrying in 3 seconds."
+            sleep 3
+          done
+
+          current="$(kubectl get service/todolist -n "${NAMESPACE}" -o jsonpath='{.spec.selector.color}')"
+          if [ "${current}" != "${active}" ]; then
+            echo "Production changed unexpectedly from ${active} to ${current}." >&2
+            exit 1
+          fi
+          curl -fsS -H 'Host: todolist-bg.local' http://localhost/healthz
+          echo
+          echo "Candidate is healthy on ${COLOR}; production remains on ${active}."
+          REMOTE

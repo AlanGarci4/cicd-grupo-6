@@ -264,8 +264,9 @@ alcança o cluster.
 ## 9. Aplicar o manifesto da app (próximo passo)
 
 Com o canal validado, o deploy simples é aplicar `k8s/todolist.yaml` no cluster.
-Antes, troque `SEU_USUARIO_DOCKERHUB` na linha `image:` do manifesto pelo seu
-usuário do Docker Hub.
+O workflow `cd.yml` renderiza o usuário, o repositório e o SHA da imagem antes de
+copiar o manifesto. Para um teste manual, substitua a linha `image:` por uma imagem
+existente no formato `<usuario>/todolist:<SHA-curto>`.
 
 Como o repositório é **privado**, não dá para baixar o manifesto por `curl` direto.
 No terminal do Console (dentro da VM), cole o conteúdo de `k8s/todolist.yaml` (do

@@ -65,7 +65,7 @@ Cadastrados em **Settings → Secrets and variables → Actions**:
 | `EC2_SSH_KEY` | secret | Chave SSH **privada** gerada na VM, conteúdo completo |
 | `EC2_HOST` | secret | Public IPv4 address da EC2 |
 | `EC2_USER` | secret | Usuário SSH da VM (`ec2-user`) |
-| `DOCKERHUB_USERNAME` | secret | Compõe o nome da imagem (`<usuário>/app-k8s-todolist`) |
+| `DOCKERHUB_USERNAME` | secret | Compõe o nome da imagem (`<usuário>/todolist`) |
 | `KIND_CLUSTER` | variable | Nome do cluster kind (default `devops-labs` se ausente) |
 
 Ao copiar a chave privada, copie **tudo**, das linhas
@@ -77,13 +77,13 @@ Os secrets do CI (`DOCKERHUB_TOKEN`, `NOTIFY_WEBHOOK_URL`) estão em
 
 ### A imagem e os manifestos
 
-- A imagem `<DOCKERHUB_USERNAME>/app-k8s-todolist:<tag>` precisa **existir** no
-  Docker Hub. O CI publica `latest` no push da `main`.
+- A imagem `<DOCKERHUB_USERNAME>/todolist:<SHA-curto>` precisa **existir** no
+  Docker Hub. O CI publica o SHA curto e `latest` no push da `main`, mas os
+  deploys aceitam somente o SHA curto.
 - O repositório no Docker Hub precisa ser **público** — se for privado, falta um
   `imagePullSecret` no cluster (ver [Próximos passos](#próximos-passos)).
-- **Antes do primeiro deploy**, troque `SEU_USUARIO_DOCKERHUB` nas linhas `image:`
-  dos manifestos em `k8s/` pelo usuário do Docker Hub: 1 ocorrência em
-  `todolist.yaml` e 2 em `blue-green/bootstrap.yaml` (uma por cor).
+- Os workflows renderizam as referências de imagem no runner. Não grave o usuário
+  do Docker Hub diretamente nos manifestos.
 
 ### Valide o canal antes de deployar
 
@@ -125,8 +125,8 @@ A estratégia padrão do Kubernetes e o ponto de partida: manual, um ambiente s�
 1. **Checkout** — traz `k8s/todolist.yaml` para o runner.
 2. **Configure SSH key** — grava o secret em `~/.ssh/id_ed25519`, ajusta permissão
    (o SSH recusa chave com permissão frouxa) e registra o host em `known_hosts`.
-3. **Pin image tag** — reescreve a linha `image:` do manifesto com `sed`. Casando a
-   partir de `image:`, a indentação do YAML é preservada.
+3. **Pin image tag** — valida o SHA curto, confirma a imagem no registry e
+   reescreve a linha `image:` do manifesto no runner.
 4. **Copy manifest** — `scp` do manifesto ajustado para a home na EC2.
 5. **Apply and wait for rollout** — seleciona o contexto `kind-${KIND_CLUSTER}`,
    roda `kubectl apply` e espera com `kubectl rollout status --timeout=120s`. **Este
@@ -148,7 +148,7 @@ Não é automático. Duas opções:
 
 ```bash
 # Opção 1: re-deployar a tag anterior pelo próprio pipeline
-gh workflow run cd.yml -f image_tag=<tag-anterior>
+gh workflow run cd.yml --ref main -f image_tag=<sha-anterior>
 
 # Opção 2: na VM, desfazer a última revisão
 kubectl rollout undo deployment/todolist -n todolist
@@ -179,23 +179,34 @@ A ideia central: **o switch mexe só no selector do Service de produção.** O I
 e os hosts nunca mudam. Roteamento é dado declarativo, não infra.
 
 **Bootstrap** (`k8s/blue-green/bootstrap.yaml`) cria os dois Deployments, os três
-Services e o Ingress, com produção começando em `blue`. A pipeline de deploy aplica
-isso sozinha na primeira execução, se o namespace ainda não existir.
+Services e o Ingress, com produção começando em `blue`. Na primeira execução, o
+workflow exige `baseline_tag`, inicializa os dois slots nessa versão e publica a
+imagem candidata somente em `green`. Assim, a candidata nunca entra diretamente
+no slot ativo.
 
 ### Pipeline de deploy (`cd-blue-green.yml`)
 
 Publica uma versão no slot escolhido, **sem** tocar no tráfego de produção.
 
-Inputs: `color` (blue|green) e `image_tag`.
+Inputs: `color` (blue|green), `image_tag` e `baseline_tag` opcional. O último é
+obrigatório somente quando o namespace ainda não existe.
 
 1. `kubectl set image` no Deployment da cor + `rollout status`.
 2. Smoke test no host **fixo do slot** (`blue.` / `green.todolist-bg.local`) — não
    no host de produção.
-3. Avisa no log se a cor escolhida já é a de produção (o deploy iria direto ao
-   tráfego, anulando a rede de proteção do blue/green), mas **segue**.
+3. Interrompe o workflow se a cor escolhida já é a de produção.
 
 ```bash
-gh workflow run cd-blue-green.yml -f color=green -f image_tag=latest
+# Primeira execução: baseline nos dois slots e candidata somente em green
+gh workflow run cd-blue-green.yml --ref main \
+  -f color=green \
+  -f baseline_tag=<sha-estavel> \
+  -f image_tag=<sha-candidato>
+
+# Execuções seguintes: baseline_tag não é mais necessário
+gh workflow run cd-blue-green.yml --ref main \
+  -f color=<cor-inativa> \
+  -f image_tag=<sha-candidato>
 ```
 
 ### Pipeline de switch (`cd-blue-green-switch.yml`)
@@ -205,12 +216,13 @@ O cutover. Input: `color`.
 1. Confirma que o slot alvo está **saudável** no host dele, antes de virar. Virar
    tráfego para slot doente é causar incidente com um clique.
 2. `kubectl patch` no selector do Service `todolist` → cor escolhida.
-3. Confirma o `/healthz` no host de produção.
+3. Confirma o `/healthz` no host de produção e restaura a cor anterior se o teste
+   falhar.
 4. Imprime no log como fazer o rollback. Log bom é o que serve na hora do
    incidente.
 
 ```bash
-gh workflow run cd-blue-green-switch.yml -f color=green
+gh workflow run cd-blue-green-switch.yml --ref main -f color=green
 ```
 
 ### Fluxo típico
