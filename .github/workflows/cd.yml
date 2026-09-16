@@ -1,0 +1,130 @@
+name: CD Rolling Update
+
+run-name: Rolling deploy (${{ inputs.image_tag }})
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: Short commit SHA published by CI
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cd-rolling
+  cancel-in-progress: false
+
+env:
+  IMAGE_NAME: todolist
+  NAMESPACE: todolist
+  REMOTE_MANIFEST: todolist-${{ github.run_id }}-${{ github.run_attempt }}.yaml
+
+jobs:
+  deploy:
+    name: Deploy to kind with Rolling Update
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Validate deployment inputs
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          KIND_CLUSTER: ${{ vars.KIND_CLUSTER || 'devops-labs' }}
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF}" != "refs/heads/main" ]; then
+            echo "CD workflows must be run from the main branch." >&2
+            exit 1
+          fi
+          if [[ ! "${IMAGE_TAG}" =~ ^[0-9a-f]{7}$ ]]; then
+            echo "image_tag must be a seven-character lowercase commit SHA." >&2
+            exit 1
+          fi
+          if [[ ! "${DOCKERHUB_USERNAME}" =~ ^[a-z0-9][a-z0-9._-]*$ ]]; then
+            echo "DOCKERHUB_USERNAME is missing or invalid." >&2
+            exit 1
+          fi
+          if [[ ! "${KIND_CLUSTER}" =~ ^[a-z0-9][a-z0-9-]*[a-z0-9]$ ]]; then
+            echo "KIND_CLUSTER is invalid." >&2
+            exit 1
+          fi
+
+      - name: Confirm image exists in Docker Hub
+        env:
+          IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ inputs.image_tag }}
+        run: docker manifest inspect "${IMAGE}" >/dev/null
+
+      - name: Render deployment manifest
+        env:
+          IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ inputs.image_tag }}
+        run: |
+          set -euo pipefail
+          sed -i -E "s#^([[:space:]]*)image:.*#\1image: ${IMAGE}#" k8s/todolist.yaml
+          grep -F "image: ${IMAGE}" k8s/todolist.yaml
+
+      - name: Configure SSH
+        uses: ./.github/actions/configure-ssh
+        with:
+          ssh-key: ${{ secrets.EC2_SSH_KEY }}
+          host: ${{ secrets.EC2_HOST }}
+
+      - name: Copy manifest to EC2
+        env:
+          SSH_HOST: ${{ secrets.EC2_HOST }}
+          SSH_USER: ${{ secrets.EC2_USER }}
+        run: |
+          scp -i ~/.ssh/id_ed25519 \
+            -o BatchMode=yes \
+            -o ConnectTimeout=15 \
+            -o StrictHostKeyChecking=yes \
+            k8s/todolist.yaml \
+            "${SSH_USER}@${SSH_HOST}:${REMOTE_MANIFEST}"
+
+      - name: Apply, wait and smoke test
+        env:
+          IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ inputs.image_tag }}
+          KIND_CLUSTER: ${{ vars.KIND_CLUSTER || 'devops-labs' }}
+          SSH_HOST: ${{ secrets.EC2_HOST }}
+          SSH_USER: ${{ secrets.EC2_USER }}
+        run: |
+          ssh -i ~/.ssh/id_ed25519 \
+            -o BatchMode=yes \
+            -o ConnectTimeout=15 \
+            -o StrictHostKeyChecking=yes \
+            "${SSH_USER}@${SSH_HOST}" \
+            "KIND_CLUSTER='${KIND_CLUSTER}' NAMESPACE='${NAMESPACE}' MANIFEST='${REMOTE_MANIFEST}' EXPECTED_IMAGE='${IMAGE}' bash -s" <<'REMOTE'
+          set -euo pipefail
+          trap 'rm -f "${HOME}/${MANIFEST}"' EXIT
+
+          kubectl config use-context "kind-${KIND_CLUSTER}"
+          kubectl apply -f "${HOME}/${MANIFEST}"
+          kubectl rollout status deployment/todolist -n "${NAMESPACE}" --timeout=120s
+
+          actual_image="$(kubectl get deployment/todolist -n "${NAMESPACE}" -o jsonpath='{.spec.template.spec.containers[?(@.name=="todolist")].image}')"
+          if [ "${actual_image}" != "${EXPECTED_IMAGE}" ]; then
+            echo "Expected ${EXPECTED_IMAGE}, but the Deployment uses ${actual_image}." >&2
+            exit 1
+          fi
+
+          kubectl get pods -n "${NAMESPACE}" -l app=todolist \
+            -o jsonpath='{range .items[*]}{.metadata.name}{" image="}{.spec.containers[0].image}{" imageID="}{.status.containerStatuses[0].imageID}{"\n"}{end}'
+
+          for attempt in $(seq 1 20); do
+            if curl -fsS -H 'Host: todolist.local' http://localhost/healthz; then
+              echo
+              echo "Rolling deployment smoke test passed."
+              exit 0
+            fi
+            echo "Smoke test attempt ${attempt}/20 failed; retrying in 3 seconds."
+            sleep 3
+          done
+
+          echo "Rolling deployment smoke test failed." >&2
+          exit 1
+          REMOTE

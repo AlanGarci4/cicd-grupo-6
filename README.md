@@ -27,7 +27,32 @@ O pipeline do laboratório usa GitHub Actions como quality gate de verdade.
 - Push da imagem para Docker Hub somente quando os gates passam
 
 ## Pipeline de CD
-A parte de CD do projeto usa o mesmo repositório como base e segue a arquitetura aprendida no laboratório para deploy em staging, com ambientes protegidos e publicação de artefatos versionados. O fluxo foi montado para ser reutilizado na entrega posterior com rolling e blue/green.
+A entrega contínua leva imagens versionadas por SHA do Docker Hub para um cluster
+kind em uma EC2, usando GitHub Actions, SCP e SSH. Existem três operações:
+
+- `cd.yml`: Rolling Update, rollout status e smoke test pelo Ingress.
+- `cd-blue-green.yml`: bootstrap com baseline e deploy somente no slot inativo.
+- `cd-blue-green-switch.yml`: switch separado do tráfego e rollback pela cor anterior.
+
+Os deploys são manuais e devem ser disparados a partir da `main`:
+
+```bash
+gh workflow run cd.yml --ref main -f image_tag=<sha-curto>
+
+gh workflow run cd-blue-green.yml --ref main \
+  -f color=green \
+  -f baseline_tag=<sha-estavel> \
+  -f image_tag=<sha-candidato>
+
+gh workflow run cd-blue-green-switch.yml --ref main -f color=green
+
+# rollback Blue/Green
+gh workflow run cd-blue-green-switch.yml --ref main -f color=blue
+```
+
+Depois do primeiro bootstrap, `baseline_tag` não deve ser informado novamente. O
+deploy Blue/Green consulta o selector do Service de produção e recusa alterações
+na cor ativa.
 
 ## Como rodar localmente
 ```bash

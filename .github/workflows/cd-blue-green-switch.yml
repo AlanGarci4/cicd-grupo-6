@@ -1,0 +1,125 @@
+name: CD Blue/Green switch
+
+run-name: Blue/Green switch to ${{ inputs.color }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      color:
+        description: Slot that will receive production traffic
+        required: true
+        type: choice
+        options:
+          - green
+          - blue
+        default: green
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cd-blue-green
+  cancel-in-progress: false
+
+env:
+  NAMESPACE: todolist-bg
+
+jobs:
+  switch:
+    name: Switch production traffic
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    environment:
+      name: production
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Validate switch inputs
+        env:
+          KIND_CLUSTER: ${{ vars.KIND_CLUSTER || 'devops-labs' }}
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF}" != "refs/heads/main" ]; then
+            echo "CD workflows must be run from the main branch." >&2
+            exit 1
+          fi
+          if [[ ! "${KIND_CLUSTER}" =~ ^[a-z0-9][a-z0-9-]*[a-z0-9]$ ]]; then
+            echo "KIND_CLUSTER is invalid." >&2
+            exit 1
+          fi
+
+      - name: Configure SSH
+        uses: ./.github/actions/configure-ssh
+        with:
+          ssh-key: ${{ secrets.EC2_SSH_KEY }}
+          host: ${{ secrets.EC2_HOST }}
+
+      - name: Validate slot and switch traffic
+        env:
+          COLOR: ${{ inputs.color }}
+          KIND_CLUSTER: ${{ vars.KIND_CLUSTER || 'devops-labs' }}
+          SSH_HOST: ${{ secrets.EC2_HOST }}
+          SSH_USER: ${{ secrets.EC2_USER }}
+        run: |
+          ssh -i ~/.ssh/id_ed25519 \
+            -o BatchMode=yes \
+            -o ConnectTimeout=15 \
+            -o StrictHostKeyChecking=yes \
+            "${SSH_USER}@${SSH_HOST}" \
+            "COLOR='${COLOR}' KIND_CLUSTER='${KIND_CLUSTER}' NAMESPACE='${NAMESPACE}' bash -s" <<'REMOTE'
+          set -euo pipefail
+
+          smoke_test() {
+            local host="$1"
+            for attempt in $(seq 1 20); do
+              if curl -fsS -H "Host: ${host}" http://localhost/healthz; then
+                echo
+                return 0
+              fi
+              echo "Smoke test for ${host}, attempt ${attempt}/20, failed; retrying in 3 seconds."
+              sleep 3
+            done
+            return 1
+          }
+
+          kubectl config use-context "kind-${KIND_CLUSTER}"
+          kubectl get "deployment/todolist-${COLOR}" -n "${NAMESPACE}" >/dev/null
+          kubectl get service/todolist -n "${NAMESPACE}" >/dev/null
+
+          previous="$(kubectl get service/todolist -n "${NAMESPACE}" -o jsonpath='{.spec.selector.color}')"
+          if [ "${previous}" = "${COLOR}" ]; then
+            echo "Production already points to ${COLOR}; no switch was performed." >&2
+            exit 1
+          fi
+          if [ "${previous}" != blue ] && [ "${previous}" != green ]; then
+            echo "Production Service has an invalid active color: ${previous}." >&2
+            exit 1
+          fi
+
+          echo "Validating the ${COLOR} slot before switching production."
+          if ! smoke_test "${COLOR}.todolist-bg.local"; then
+            echo "The ${COLOR} slot is unhealthy; production remains on ${previous}." >&2
+            exit 1
+          fi
+
+          kubectl patch service/todolist -n "${NAMESPACE}" --type=merge \
+            -p "{\"spec\":{\"selector\":{\"color\":\"${COLOR}\"}}}"
+
+          selected="$(kubectl get service/todolist -n "${NAMESPACE}" -o jsonpath='{.spec.selector.color}')"
+          if [ "${selected}" != "${COLOR}" ]; then
+            echo "Service selector did not change to ${COLOR}." >&2
+            exit 1
+          fi
+
+          if ! smoke_test todolist-bg.local; then
+            echo "Production smoke test failed; restoring traffic to ${previous}." >&2
+            kubectl patch service/todolist -n "${NAMESPACE}" --type=merge \
+              -p "{\"spec\":{\"selector\":{\"color\":\"${previous}\"}}}"
+            smoke_test todolist-bg.local || true
+            exit 1
+          fi
+
+          echo "Production switched from ${previous} to ${COLOR}."
+          echo "Rollback: gh workflow run cd-blue-green-switch.yml --ref main -f color=${previous}"
+          REMOTE
