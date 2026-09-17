@@ -224,7 +224,7 @@ fluxo do commit até o pod.
 | Rolling Update + smoke test | Sucesso | [GitHub Actions](https://github.com/AlanGarci4/cicd-grupo-6/actions/runs/35163584284) |
 | Deploy `76ac744` no slot green inativo | Sucesso, produção permaneceu blue | [GitHub Actions](https://github.com/AlanGarci4/cicd-grupo-6/actions/runs/35163640505) |
 | Switch de blue para green | Sucesso após aprovação | [GitHub Actions](https://github.com/AlanGarci4/cicd-grupo-6/actions/runs/35164527620) |
-| Rollback de green para blue | Pendente de execução | A registrar |
+| Rollback de green para blue | Sucesso | [GitHub Actions](https://github.com/AlanGarci4/cicd-grupo-6/actions/runs/35165021820) |
 
 ## Limitações conhecidas
 
@@ -244,7 +244,7 @@ fluxo do commit até o pod.
 - [x] Manifests com Deployment, Service `ClusterIP`, Ingress e probes
 - [x] Rolling Update com rollout e smoke test pelo Ingress
 - [x] Blue/Green com deploy no slot inativo e switch separado
-- [ ] Rollback Blue/Green executado e registrado
+- [x] Rollback Blue/Green executado e registrado
 - [x] Environment `production` com required reviewers
 - [x] README com comandos, arquitetura, rollback e decisões técnicas
 - [ ] Prints e vídeo curto de contingência organizados
