@@ -22,6 +22,16 @@ Coloque nesta pasta os prints usados na apresentação.
 - 17-repo-home-badge-ci-verde.png
 - 18-repo-home-badge-ainda-vermelho.png (opcional, transição antes do verde)
 
+## Atividade 2 - CD
+
+- `19-ci-publicacao-imagem-versionada.png`
+- `20-validate-ssh-sucesso.png`
+- `21-rolling-update-sucesso.png`
+- `22-blue-green-deploy-green-inativo.png`
+- `23-switch-aprovado-producao.png`
+- `24-switch-producao-green.png`
+- `25-rollback-producao-blue.png`
+
 Checklist do que cada print deve mostrar:
 - Histórico do Actions com execução vermelha e execução verde
 - Run com os 3 jobs da matrix em vermelho
