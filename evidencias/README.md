@@ -28,7 +28,7 @@ Coloque nesta pasta os prints usados na apresentação.
 - `20-validate-ssh-sucesso.png`
 - `21-rolling-update-sucesso.png`
 - `22-blue-green-deploy-green-inativo.png`
-- `23-switch-aguardando-aprovacao.png`
+- `23-switch-aprovado-producao.png`
 - `24-switch-producao-green.png`
 - `25-rollback-producao-blue.png`
 
